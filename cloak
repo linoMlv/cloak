@@ -41,7 +41,11 @@ tor_uid() {
 
 tor_service() { # $1 = start|stop
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    systemctl "$1" tor
+    if [[ -n $(systemctl list-unit-files 'tor@.service' --no-legend 2>/dev/null | head -n1) ]]; then
+      systemctl "$1" tor@default
+    else
+      systemctl "$1" tor
+    fi
   else
     service tor "$1"
   fi
@@ -193,7 +197,11 @@ cmd_check() {
 
   # 4) tor service
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    tor_svc=$(systemctl is-active tor 2>/dev/null | head -n1)
+    if [[ -n $(systemctl list-unit-files 'tor@.service' --no-legend 2>/dev/null | head -n1) ]]; then
+      tor_svc=$(systemctl is-active tor@default 2>/dev/null | head -n1)
+    else
+      tor_svc=$(systemctl is-active tor 2>/dev/null | head -n1)
+    fi
     [[ -z $tor_svc ]] && tor_svc="unknown"
   elif pgrep -x tor >/dev/null 2>&1; then
     tor_svc="active (process detected)"
