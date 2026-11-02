@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  cloak — routes all machine traffic through Tor, with kill-switch
+#
+#    cloak on       tor + transparent redirection + kill-switch (root required)
+#    cloak off      back to direct traffic, tor stopped             (root required)
+#    cloak check    status: IP, consistency, geolocation, latency   (no root needed)
+#    cloak status   alias for check
+#    cloak help
+#
+#  Designed for WSL2 (Debian/Kali/Ubuntu); works on regular Linux too.
+# ============================================================================
+
+set -u
+
+VERSION="1.0.0"
+TRANS_PORT=9040        # TransPort  (TCP -> Tor)
+DNS_PORT=5353          # DNSPort    (DNS -> Tor)
+SOCKS_PORT=9050        # SocksPort  (bootstrap test)
+TIMEOUT=15             # curl timeout (s)
+BOOTSTRAP_TRIES=30     # max bootstrap wait (~3 min)
+
+G=$'\e[1;32m'; R=$'\e[1;31m'; Y=$'\e[1;33m'; C=$'\e[1;36m'; D=$'\e[2m'; N=$'\e[0m'
+TOR_USER=""            # autodetected: debian-tor | tor | _tor
+RT=""; BODY=""
+
+# ---------------------------------------------------------------- helpers ---
+die()  { printf '%s[-]%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+ok()   { printf '%s[+]%s %s\n' "$G" "$N" "$*"; }
+info() { printf '%s[*]%s %s\n' "$C" "$N" "$*"; }
+
+require_root() { [[ $(id -u) -eq 0 ]] || die "root privileges required: sudo cloak ${1:-}"; }
+
+tor_uid() {
+  local u
+  for u in debian-tor tor _tor; do
+    if id -u "$u" >/dev/null 2>&1; then TOR_USER=$u; return 0; fi
+  done
+  return 1
+}
+
+tor_service() { # $1 = start|stop
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    systemctl "$1" tor
+  else
+    service tor "$1"
+  fi
+}
+
+cleanup_rules() {
+  iptables  -t nat -D OUTPUT -j TOR_NAT  2>/dev/null || true
+  iptables  -t nat -F TOR_NAT  2>/dev/null || true
+  iptables  -t nat -X TOR_NAT  2>/dev/null || true
+  iptables  -D OUTPUT -j TOR_FW   2>/dev/null || true
+  iptables  -F TOR_FW   2>/dev/null || true
+  iptables  -X TOR_FW   2>/dev/null || true
+  ip6tables -D OUTPUT -j TOR_FW6  2>/dev/null || true
+  ip6tables -F TOR_FW6  2>/dev/null || true
+  ip6tables -X TOR_FW6  2>/dev/null || true
+}
+
+fetch() { curl -4 -s --max-time "$TIMEOUT" -w '\n%{time_total}' "$1" 2>/dev/null; }
+split() {
+  RT=${1##*$'\n'}
+  if [[ $RT =~ ^[0-9]+([.][0-9]+)?$ ]]; then BODY=${1%$'\n'*}; else RT=""; BODY=${1:-}; fi
+}
+ms()   { awk -v s="$1" 'BEGIN{printf "%.0f", s*1000}'; }
+jstr() { grep -oP "\"$2\"\s*:\s*\"\K[^\"]*" <<<"${1:-}" 2>/dev/null | head -n1; }
+row()  {
+  local label=$1 val=${2:-} pad=""
+  [[ -n $val ]] || return 0
+  val=${val//$'\n'/ }
+  (( ${#label} >= 22 )) || printf -v pad '%*s' $((22 - ${#label})) ''
+  printf "  ${C}%s${N}%s : %s\n" "$label" "$pad" "$val"
+}
+
+# ------------------------------------------------------------------ on ------
+cmd_on() {
+  require_root on
+  tor_uid || die "tor user not found — is tor installed?"
+
+  if grep -qs 'nameserver 127.0.0.53' /etc/resolv.conf; then
+    die "/etc/resolv.conf points to the systemd-resolved stub (127.0.0.53) → DNS loop.
+     Point it to a direct resolver (e.g. 10.255.255.254 under WSL2) first."
+  fi
+
+  info "Starting tor…"
+  tor_service start || die "failed to start tor service (see: journalctl -u tor -n 50)"
+
+  info "Waiting for Tor bootstrap "
+  local ready="" i
+  for i in $(seq 1 "$BOOTSTRAP_TRIES"); do
+    if curl -4 -s --max-time 4 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+         https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+      ready=1; break
+    fi
+    printf '.'; sleep 2
+  done
+  echo
+  [[ -n $ready ]] || die "Tor did not bootstrap (filtered network? → use obfs4 bridges). Kill-switch NOT applied."
+
+  info "Applying iptables rules…"
+  # NAT: all TCP + DNS -> Tor (except loopback and tor's own traffic)
+  iptables -t nat -N TOR_NAT 2>/dev/null || true
+  iptables -t nat -F TOR_NAT
+  iptables -t nat -A TOR_NAT -o lo -j RETURN
+  iptables -t nat -A TOR_NAT -m owner --uid-owner "$TOR_USER" -j RETURN
+  # To keep direct access to the LAN / Windows host, uncomment:
+  # iptables -t nat -A TOR_NAT -d 172.16.0.0/12 -j RETURN
+  iptables -t nat -A TOR_NAT -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+  iptables -t nat -A TOR_NAT -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+  iptables -t nat -A TOR_NAT -p tcp -j REDIRECT --to-ports "$TRANS_PORT"
+  iptables -t nat -C OUTPUT -j TOR_NAT 2>/dev/null || iptables -t nat -A OUTPUT -j TOR_NAT
+
+  # Kill-switch: only tor talks directly; REDIRECTed packets (dst 127.0.0.1) pass through
+  iptables -N TOR_FW 2>/dev/null || true
+  iptables -F TOR_FW
+  iptables -A TOR_FW -o lo -j ACCEPT
+  iptables -A TOR_FW -d 127.0.0.0/8 -j ACCEPT
+  iptables -A TOR_FW -m owner --uid-owner "$TOR_USER" -j ACCEPT
+  iptables -A TOR_FW -j DROP
+  iptables -C OUTPUT -j TOR_FW 2>/dev/null || iptables -I OUTPUT 1 -j TOR_FW
+
+  # IPv6: cut off (Tor doesn't carry ICMP/UDP, it would be a leak)
+  ip6tables -N TOR_FW6 2>/dev/null || true
+  ip6tables -F TOR_FW6
+  ip6tables -A TOR_FW6 -o lo -j ACCEPT
+  ip6tables -A TOR_FW6 -m owner --uid-owner "$TOR_USER" -j ACCEPT
+  ip6tables -A TOR_FW6 -j DROP
+  ip6tables -C OUTPUT -j TOR_FW6 2>/dev/null || ip6tables -I OUTPUT 1 -j TOR_FW6
+
+  # Integrity + self-test, rollback on failure
+  if ! iptables -C OUTPUT -j TOR_FW 2>/dev/null; then
+    cleanup_rules
+    die "kill-switch not attached — rolled back."
+  fi
+  sleep 1
+  if curl -4 -s --max-time 25 https://check.torproject.org/api/ip | grep -q '"IsTor":true'; then
+    ok "Tor mode ENABLED — TCP/DNS via Tor (:$TRANS_PORT / :$DNS_PORT), ICMP/UDP blocked."
+  else
+    cleanup_rules
+    tor_service stop >/dev/null 2>&1 || true
+    die "transparent mode not working — rolled back, tor stopped."
+  fi
+}
+
+# ------------------------------------------------------------------ off -----
+cmd_off() {
+  require_root off
+  info "Removing iptables rules…"
+  cleanup_rules
+  info "Stopping tor…"
+  tor_service stop >/dev/null 2>&1 || true
+  ok "Tor mode disabled — direct traffic restored."
+}
+
+# ------------------------------------------------------------------ check ---
+cmd_check() {
+  local out t_ms="" i_ms="" tor_json="" tor_rt="" istor="" tor_ip="" ipify="" ipify_rt=""
+  local ip_now="" city="" region="" country="" cc="" org="" geo_src="" geo=""
+  local tor_svc="" icmp_ms="" icmp="" mode="" cons="" real_note="" real="" lat=""
+
+  # 1) check.torproject.org
+  out=$(fetch https://check.torproject.org/api/ip); split "$out"
+  tor_json=$BODY; tor_rt=$RT
+  [[ -n $tor_rt ]] && t_ms="$(ms "$tor_rt") ms"
+  istor=$(grep -oP '"IsTor"\s*:\s*\K(true|false)' <<<"$tor_json" | head -n1)
+  tor_ip=$(jstr "$tor_json" IP)
+
+  # 2) api.ipify.org
+  out=$(fetch https://api.ipify.org); split "$out"
+  ipify=$(printf '%s' "$BODY" | tr -d '[:space:]'); ipify_rt=$RT
+  [[ -n $ipify_rt ]] && i_ms="$(ms "$ipify_rt") ms"
+
+  # 3) geolocation of the current IP
+  ip_now=${tor_ip:-$ipify}
+  if [[ -n $ip_now ]]; then
+    out=$(fetch "https://ipwho.is/$ip_now"); split "$out"
+    city=$(jstr "$BODY" city); geo_src="ipwho.is"
+    if [[ -z $city ]]; then
+      out=$(fetch "https://ipinfo.io/$ip_now/json"); split "$out"
+      city=$(jstr "$BODY" city); geo_src="ipinfo.io"
+    fi
+    region=$(jstr "$BODY" region); country=$(jstr "$BODY" country)
+    cc=$(jstr "$BODY" country_code); org=$(jstr "$BODY" org)
+    [[ -z $cc && ${#country} -eq 2 ]] && cc=$country
+  fi
+  [[ -n $city ]]   && geo+="$city"
+  [[ -n $region ]] && geo+="${geo:+, }$region"
+  [[ -n $cc ]]     && geo+="${geo:+ }[$cc]"
+  [[ -n $org ]]    && geo+="${geo:+ — }$org"
+  [[ -n $geo ]]    && geo+="${D}  [via $geo_src]${N}"
+
+  # 4) tor service
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    tor_svc=$(systemctl is-active tor 2>/dev/null | head -n1)
+    [[ -z $tor_svc ]] && tor_svc="unknown"
+  elif pgrep -x tor >/dev/null 2>&1; then
+    tor_svc="active (process detected)"
+  else
+    tor_svc="inactive"
+  fi
+
+  # 5) ICMP latency (blocked in Tor mode by design)
+  icmp_ms=$(ping -c1 -W1 1.1.1.1 2>/dev/null | grep -oP 'time=\K[0-9.]+')
+  if [[ -n $icmp_ms ]]; then
+    icmp="${icmp_ms} ms"
+  elif [[ $istor == true ]]; then
+    icmp="${Y}blocked — expected in Tor mode (kill-switch)${N}"
+  else
+    icmp="${D}no response${N}"
+  fi
+
+  # 6) verdicts
+  case $istor in
+    true)  mode="${G}TORified${N}" ;;
+    false) mode="${R}direct (not torified)${N}" ;;
+    *)     mode="${Y}undetermined (torproject API unreachable)${N}" ;;
+  esac
+  if [[ -n $tor_ip && -n $ipify ]]; then
+    if [[ $tor_ip == "$ipify" ]]; then cons="${G}✓ consistent${N}"
+    else cons="${R}✗ MISMATCH (split routing?)${N}"; fi
+  else
+    cons="${D}n/a${N}"
+  fi
+
+  # 7) real IP cache (useful for leak detection)
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/cloak"
+  mkdir -p "$cache" 2>/dev/null
+  if [[ $istor == false && -n $ip_now ]]; then
+    printf '%s' "$ip_now" >"$cache/real_ip" 2>/dev/null \
+      && real_note="${D}→ $ip_now saved as real IP${N}"
+  elif [[ -r $cache/real_ip ]]; then
+    real=$(<"$cache/real_ip")
+    if [[ -n $real ]]; then
+      if [[ $real == "$ip_now" ]]; then
+        real_note="${R}$real — same as current IP → leak?${N}"
+      else
+        real_note="${G}$real${N} ${D}→ differs from current IP: no leak${N}"
+      fi
+    fi
+  fi
+
+  lat=""
+  [[ -n $t_ms ]] && lat="$t_ms (torproject)"
+  [[ -n $i_ms ]] && lat="${lat:+$lat — }$i_ms (ipify)"
+
+  printf "\n${C}cloak check${N} ${D}— %s${N}\n" "$(date '+%F %T')"
+  if [[ -z $tor_json && -z $ipify ]]; then
+    row "Network" "${R}no response — tor running but dead? kill-switch stuck?${N}"
+  fi
+  row "tor service"       "$tor_svc"
+  row "Mode"              "$mode"
+  row "IP (torproject)"   "${tor_ip}${tor_ip:+  }$cons"
+  row "IP (ipify)"        "$ipify"
+  row "Est. geolocation"  "$geo"
+  row "HTTP latency"      "$lat"
+  row "Ping ICMP 1.1.1.1" "$icmp"
+  row "Real IP (cache)"   "$real_note"
+  echo
+
+  [[ $istor == true ]]  && exit 0
+  [[ $istor == false ]] && exit 1
+  exit 2
+}
+
+# ------------------------------------------------------------------ misc ----
+usage() {
+  cat <<EOF
+cloak $VERSION — routes all traffic through Tor, with kill-switch
+
+  cloak on        starts tor, applies transparent redirection + kill-switch
+  cloak off       removes the rules and stops tor (direct traffic restored)
+  cloak check     tunnel status: IP, consistency, geolocation, latency
+  cloak status    alias for check
+  cloak help      this help
+EOF
+}
+
+self_path() {
+  local p
+  p=$(readlink -f "$0" 2>/dev/null) && [[ -x $p ]] && { echo "$p"; return; }
+  p=$(command -v cloak 2>/dev/null) && [[ -x $p ]] && { echo "$p"; return; }
+  echo "$0"
+}
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    on)  [[ $(id -u) -eq 0 ]] || exec sudo "$(self_path)" on;  cmd_on ;;
+    off) [[ $(id -u) -eq 0 ]] || exec sudo "$(self_path)" off; cmd_off ;;
+    check|status) cmd_check ;;
+    version|-v|--version) echo "cloak $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
