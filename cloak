@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 TRANS_PORT=9040        # TransPort  (TCP -> Tor)
 DNS_PORT=5353          # DNSPort    (DNS -> Tor)
 SOCKS_PORT=9050        # SocksPort  (bootstrap test)
@@ -22,6 +22,7 @@ BOOTSTRAP_TRIES=30     # max bootstrap wait (~3 min)
 
 G=$'\e[1;32m'; R=$'\e[1;31m'; Y=$'\e[1;33m'; C=$'\e[1;36m'; D=$'\e[2m'; N=$'\e[0m'
 TOR_USER=""            # autodetected: debian-tor | tor | _tor
+TOR_UNIT=""            # autodetected systemd unit: tor@default | tor | empty (sysv)
 RT=""; BODY=""
 
 # ---------------------------------------------------------------- helpers ---
@@ -39,17 +40,34 @@ tor_uid() {
   return 1
 }
 
-tor_service() { # $1 = start|stop
+detect_tor_unit() {
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     if [[ -n $(systemctl list-unit-files 'tor@.service' --no-legend 2>/dev/null | head -n1) ]]; then
-      systemctl "$1" tor@default
-    else
-      systemctl "$1" tor
+      TOR_UNIT="tor@default"   # Debian/Kali modern: tor.service is an empty multi-instance master
+    elif [[ -n $(systemctl list-unit-files 'tor.service' --no-legend 2>/dev/null | head -n1) ]]; then
+      TOR_UNIT="tor"
     fi
+  fi
+}
+
+tor_service() { # $1 = start|stop|restart
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ -n $TOR_UNIT ]]; then
+    systemctl reset-failed "$TOR_UNIT" 2>/dev/null   # clears a "start-limit-hit" state
+    systemctl "$1" "$TOR_UNIT"
   else
     service tor "$1"
   fi
 }
+
+tor_active() {
+  if [[ -n $TOR_UNIT ]]; then
+    [[ $(systemctl is-active "$TOR_UNIT" 2>/dev/null) == active ]]
+  else
+    pgrep -x tor >/dev/null 2>&1
+  fi
+}
+
+tor_listening() { ss -tln 2>/dev/null | grep -q ":$SOCKS_PORT[[:space:]]"; }
 
 cleanup_rules() {
   iptables  -t nat -D OUTPUT -j TOR_NAT  2>/dev/null || true
@@ -89,14 +107,28 @@ cmd_on() {
   fi
 
   info "Starting tor…"
-  tor_service start || die "failed to start tor service (see: journalctl -u tor -n 50)"
+  tor_service restart || die "failed to start tor (see: journalctl -u ${TOR_UNIT:-tor} -n 50)"
+
+  # tor may exit right after start (config, permissions, port conflict)
+  local listening="" i
+  for i in $(seq 1 30); do
+    tor_listening && { listening=1; break; }
+    sleep 0.5
+  done
+  [[ -n $listening ]] || die "tor is not listening on port $SOCKS_PORT — check journalctl -u ${TOR_UNIT:-tor} -n 50"
 
   info "Waiting for Tor bootstrap "
-  local ready="" i
+  local ready="" i rc body
   for i in $(seq 1 "$BOOTSTRAP_TRIES"); do
-    if curl -4 -s --max-time 4 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
-         https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+    body=$(curl -4 -s --max-time 4 --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+         https://check.torproject.org/api/ip 2>/dev/null)
+    rc=$?
+    if [[ $rc -eq 0 ]] && grep -q '"IsTor":true' <<<"$body"; then
       ready=1; break
+    fi
+    if [[ $rc -eq 7 ]]; then
+      echo
+      die "tor stopped listening mid-bootstrap — check journalctl -u ${TOR_UNIT:-tor} -n 50"
     fi
     printf '.'; sleep 2
   done
@@ -155,6 +187,7 @@ cmd_off() {
   cleanup_rules
   info "Stopping tor…"
   tor_service stop >/dev/null 2>&1 || true
+  [[ -n $TOR_UNIT ]] && systemctl reset-failed "$TOR_UNIT" 2>/dev/null || true
   ok "Tor mode disabled — direct traffic restored."
 }
 
@@ -196,15 +229,8 @@ cmd_check() {
   [[ -n $geo ]]    && geo+="${D}  [via $geo_src]${N}"
 
   # 4) tor service
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    if [[ -n $(systemctl list-unit-files 'tor@.service' --no-legend 2>/dev/null | head -n1) ]]; then
-      tor_svc=$(systemctl is-active tor@default 2>/dev/null | head -n1)
-    else
-      tor_svc=$(systemctl is-active tor 2>/dev/null | head -n1)
-    fi
-    [[ -z $tor_svc ]] && tor_svc="unknown"
-  elif pgrep -x tor >/dev/null 2>&1; then
-    tor_svc="active (process detected)"
+  if tor_active; then
+    tor_svc="active${TOR_UNIT:+ ($TOR_UNIT)}"
   else
     tor_svc="inactive"
   fi
@@ -294,6 +320,7 @@ self_path() {
 
 main() {
   local cmd="${1:-help}"
+  detect_tor_unit
   case "$cmd" in
     on)  [[ $(id -u) -eq 0 ]] || exec sudo "$(self_path)" on;  cmd_on ;;
     off) [[ $(id -u) -eq 0 ]] || exec sudo "$(self_path)" off; cmd_off ;;
